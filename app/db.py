@@ -69,6 +69,24 @@ def init_db():
     
     conn.commit()
     
+  
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.transfers_pending (
+        id SERIAL PRIMARY KEY,
+        sender_user_id INTEGER NOT NULL REFERENCES bank.users(id),
+        target_username VARCHAR(50) NOT NULL,
+        target_user_id INTEGER NOT NULL REFERENCES bank.users(id),
+        amount NUMERIC(10,2) NOT NULL,
+        otp_code VARCHAR(6) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending'
+    ); commit;
+    """)
+    
+    conn.commit()
+    
+
     # Insertar datos de ejemplo si no existen usuarios
     cur.execute("SELECT COUNT(*) FROM bank.users;")
     count = cur.fetchone()[0]
