@@ -561,8 +561,14 @@ class TransferRegister(Resource):
             api.abort(404, "Target user not found in this bank. Only transfers between clients of the same bank are allowed.")
         
         try:
-            
             target_user_id = target_user[0]
+            
+            # INVALIDAR transferencias pendientes anteriores del mismo usuario
+            cur.execute("""
+                UPDATE bank.transfers_pending 
+                SET status = 'cancelled'
+                WHERE sender_user_id = %s AND status = 'pending'
+            """, (g.user['id'],))
             
             # generate OTP code
             otp_code = str(random.randint(100000, 999999))
@@ -615,20 +621,23 @@ class TransferConfirm(Resource):
         conn = get_connection()
         cur = conn.cursor()
         
+        # buscar transferencia con OTP valido
+        cur.execute("""
+            SELECT id, target_user_id, amount, target_username
+            FROM bank.transfers_pending 
+            WHERE sender_user_id = %s AND otp_code = %s 
+            AND status = 'pending' AND expires_at > NOW()
+            LIMIT 1
+        """, (g.user['id'], otp_code))
+        
+        transfer_data = cur.fetchone()
+        
+        if not transfer_data:  # OTP invalid or expired
+            cur.close()
+            conn.close()
+            api.abort(400, "Código de verificación de la transacción inválido o expirado")
+
         try:
-            # buscar transferencia con OTP valido
-            cur.execute("""
-                SELECT id, target_user_id, amount, target_username
-                FROM bank.transfers_pending 
-                WHERE sender_user_id = %s AND otp_code = %s 
-                AND status = 'pending' AND expires_at > NOW()
-                LIMIT 1
-            """, (g.user['id'], otp_code))
-            
-            transfer_data = cur.fetchone()
-            
-            if not transfer_data:  # OTP invalid or expired
-                api.abort(400, "Invalid or expired OTP code")
             
             transfer_id, target_user_id, amount, target_username = transfer_data
             amount = float(amount)
