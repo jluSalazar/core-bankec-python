@@ -57,7 +57,20 @@ def init_db():
         user_id INTEGER REFERENCES bank.users(id)
     ); commit;
     """)
-    
+
+    # Crear la tabla de logs
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.logs (
+        id SERIAL PRIMARY KEY,
+        log_time TIMESTAMP NOT NULL,
+        log_type VARCHAR(10) NOT NULL,
+        remote_ip VARCHAR(45),
+        username TEXT,
+        action TEXT,
+        http_code INTEGER
+    ); commit;
+    """)
+
     # Create tokens table to persist authentication tokens
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bank.tokens (
