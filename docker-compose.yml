@@ -26,6 +26,7 @@ services:
       POSTGRES_DB: corebank
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+      JWT_SECRET_KEY: "oaLv9nJ2Hrs38BGKf8-bFmcM7MWIyBRDcVHa1I8sGeM"
 
 volumes:
   pgdata:
