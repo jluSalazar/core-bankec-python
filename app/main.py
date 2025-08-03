@@ -529,10 +529,23 @@ class TransferRegister(Resource):
         
         # validacion basica
         if not target_username or amount <= 0:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de registro de transferencia con datos inválidos",
+                http_code=400
+            )
             api.abort(400, "Invalid data")
         
-        # Check if transferring to self
         if target_username == g.user['username']:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de transferencia a sí mismo (register)",
+                http_code=400
+            )
             api.abort(400, "Cannot transfer to the same account")
         
         conn = get_connection()
@@ -542,12 +555,26 @@ class TransferRegister(Resource):
         cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
         row = cur.fetchone()
         if not row:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de registro de transferencia sin cuenta de origen",
+                http_code=404
+            )
             cur.close()
             conn.close()
             api.abort(404, "Sender account not found")
         
         sender_balance = float(row[0])
         if sender_balance < amount:  # insufficient funds check - MANDATORY
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de registro de transferencia con fondos insuficientes",
+                http_code=400
+            )
             cur.close()
             conn.close()
             api.abort(400, "Fondos insuficientes")
@@ -556,6 +583,13 @@ class TransferRegister(Resource):
         cur.execute("SELECT id FROM bank.users WHERE username = %s", (target_username,))
         target_user = cur.fetchone()
         if not target_user:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de registro de transferencia a usuario no encontrado",
+                http_code=404
+            )
             cur.close()
             conn.close()
             api.abort(404, "Target user not found in this bank. Only transfers between clients of the same bank are allowed.")
@@ -587,9 +621,14 @@ class TransferRegister(Resource):
             transfer_id = cur.fetchone()[0]
             conn.commit()
             
-            # log the transfer registration
-            logging.info(f"Transfer {transfer_id} registered successfully for user {g.user['username']} with OTP {otp_code}")
-            
+            log_event(
+                log_type="INFO",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action=f"Transferencia registrada (id={transfer_id}) a {target_username} por {amount} OTP:{otp_code}",
+                http_code=200
+            )
+
             return {
                 "message": "Transfer registered successfully.",
                 "transfer_id": transfer_id,
@@ -616,6 +655,13 @@ class TransferConfirm(Resource):
         
         # validate OTP
         if not otp_code or len(otp_code) != 6:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de confirmación de transferencia con OTP inválido",
+                http_code=400
+            )
             api.abort(400, "Invalid OTP code")
         
         conn = get_connection()
@@ -633,12 +679,19 @@ class TransferConfirm(Resource):
         transfer_data = cur.fetchone()
         
         if not transfer_data:  # OTP invalid or expired
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de confirmación de transferencia con OTP inválido o expirado",
+                http_code=400
+            )
             cur.close()
             conn.close()
             api.abort(400, "Código de verificación de la transacción inválido o expirado")
 
         try:
-            
+          
             transfer_id, target_user_id, amount, target_username = transfer_data
             amount = float(amount)
             
@@ -646,10 +699,24 @@ class TransferConfirm(Resource):
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
             row = cur.fetchone()
             if not row:
+                log_event(
+                    log_type="WARNING",
+                    remote_ip=request.remote_addr,
+                    username=g.user['username'],
+                    action="Intento de ejecución de transferencia sin cuenta de origen",
+                    http_code=404
+                )
                 api.abort(404, "Sender account not found")
             
             sender_balance = float(row[0])
             if sender_balance < amount:  # balance verification
+                log_event(
+                    log_type="WARNING",
+                    remote_ip=request.remote_addr,
+                    username=g.user['username'],
+                    action="Intento de ejecución de transferencia con fondos insuficientes",
+                    http_code=400
+                )
                 api.abort(400, "Insufficient funds for this transfer")
             
             # ejecutar la transferencia
@@ -667,7 +734,13 @@ class TransferConfirm(Resource):
             new_balance = float(cur.fetchone()[0])
             
             conn.commit()
-            
+            log_event(
+                log_type="INFO",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action=f"Transferencia confirmada (id={transfer_id}) a {target_username} por {amount}",
+                http_code=200
+            )
             return {
                 "message": "Transfer executed successfully",
                 "transfer_id": transfer_id,
@@ -678,6 +751,13 @@ class TransferConfirm(Resource):
             
         except Exception as e:
             conn.rollback()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action=f"Error ejecutando transferencia",
+                http_code=500
+            )
             api.abort(500, f"Error executing transfers: {str(e)}")
         finally:
             cur.close()
@@ -713,7 +793,13 @@ class PendingTransfers(Resource):
                 })
             
             total_amt = sum(t["amount"] for t in pending_list)  # variable con nombre corto
-            
+            log_event(
+                log_type="INFO",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action=f"Consulta de transferencias pendientes. Total: {len(pending_list)}",
+                http_code=200
+            )
             return {
                 "pending_transfers": pending_list,
                 "total_amount": total_amt
