@@ -232,16 +232,6 @@ class Withdraw(Resource):
         conn.close()
         return {"message": "Withdrawal successful", "new_balance": new_balance}, 200
 
-@bank_ns.route('/transfer')
-class Transfer(Resource):
-    @bank_ns.doc('transfer')
-    @token_required
-    def post(self):
-        """
-        DEPRECADO: Este endpoint ha sido reemplazado por el sistema OTP.
-        Use /transfer/register para registrar una transferencia y /transfer/confirm para confirmarla.
-        """
-        api.abort(410, "Este endpoint ha sido deprecado. Use /transfer/register para registrar transferencias y /transfer/confirm para confirmarlas con OTP.")
 
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
@@ -249,11 +239,6 @@ class CreditPayment(Resource):
     @bank_ns.doc('credit_payment')
     @token_required
     def post(self):
-        """
-        Realiza una compra a crédito:
-        - Descuenta el monto de la cuenta.
-        - Aumenta la deuda de la tarjeta de crédito.
-        """
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
@@ -300,11 +285,6 @@ class PayCreditBalance(Resource):
     @bank_ns.doc('pay_credit_balance')
     @token_required
     def post(self):
-        """
-        Realiza un abono a la deuda de la tarjeta:
-        - Descuenta el monto (o el máximo posible) de la cuenta.
-        - Reduce la deuda de la tarjeta de crédito.
-        """
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
@@ -360,16 +340,7 @@ class TransferRegister(Resource):
     @bank_ns.doc('transfer_register')
     @token_required
     def post(self):
-        """
-        Registra una transferencia pendiente y genera un OTP único.
-        
-        - Verifica que el usuario tenga fondos suficientes
-        - Verifica que el destinatario sea cliente del mismo banco
-        - Genera un OTP único de 6 dígitos válido por 15 minutos para esta transferencia
-        - Cada transferencia nueva genera su propio OTP único
-        - No se puede registrar transferencia sin fondos suficientes
-        - Devuelve el OTP en la respuesta para usar en la confirmación
-        """
+       
         data = api.payload
         target_username = data.get("target_username")
         amount = data.get("amount", 0)
@@ -452,15 +423,6 @@ class TransferConfirm(Resource):
     @bank_ns.doc('transfer_confirm')
     @token_required
     def post(self):
-        """
-        Confirma y ejecuta una transferencia específica usando su OTP único.
-        
-        - Valida el OTP de 6 dígitos específico de la transferencia
-        - Ejecuta la transferencia correspondiente a ese OTP
-        - Verifica fondos suficientes para la transferencia
-        - Solo se permiten transferencias entre clientes del mismo banco
-        - Cada transferencia tiene su propio OTP único
-        """
         data = api.payload
         otp_code = data.get("otp_code")
         
@@ -535,13 +497,6 @@ class PendingTransfers(Resource):
     @bank_ns.doc('pending_transfers')
     @token_required
     def get(self):
-        """
-        Consulta las transferencias pendientes del usuario.
-        
-        - Muestra todas las transferencias registradas pendientes de confirmación
-        - No expone el código OTP por seguridad
-        - Solo muestra transferencias activas (no expiradas)
-        """
         conn = get_connection()
         cur = conn.cursor()
         
