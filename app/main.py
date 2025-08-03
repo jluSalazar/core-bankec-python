@@ -5,9 +5,8 @@ from functools import wraps
 from app.db import get_connection, init_db
 from app.logs.logs import log_event
 import logging
-
-# Define a simple in-memory token store
-tokens = {}
+import random
+from datetime import datetime, timedelta
 
 #log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -60,17 +59,21 @@ withdraw_model = bank_ns.model('Withdraw', {
     'amount': fields.Float(required=True, description='Monto a retirar', example=100)
 })
 
-transfer_model = bank_ns.model('Transfer', {
-    'target_username': fields.String(required=True, description='Usuario destino', example='user2'),
-    'amount': fields.Float(required=True, description='Monto a transferir', example=100)
-})
-
 credit_payment_model = bank_ns.model('CreditPayment', {
     'amount': fields.Float(required=True, description='Monto de la compra a crédito', example=100)
 })
 
 pay_credit_balance_model = bank_ns.model('PayCreditBalance', {
     'amount': fields.Float(required=True, description='Monto a abonar a la deuda de la tarjeta', example=50)
+})
+
+transfer_register_model = bank_ns.model('TransferRegister', {
+    'target_username': fields.String(required=True, description='Usuario destino', example='user2'),
+    'amount': fields.Float(required=True, description='Monto a transferir', example=100)
+})
+
+transfer_confirm_model = bank_ns.model('TransferConfirm', {
+    'otp_code': fields.String(required=True, description='Código OTP de 6 dígitos', example='123456')
 })
 
 # ---------------- Authentication Endpoints ----------------
@@ -91,7 +94,7 @@ class Login(Resource):
         user = cur.fetchone()
         if user and user[2] == password:
             token = secrets.token_hex(16)
-            # Persist the token in the database
+            # Persist token in database
             cur.execute("INSERT INTO bank.tokens (token, user_id) VALUES (%s, %s)", (token, user[0]))
             conn.commit()
             cur.close()
@@ -104,7 +107,7 @@ class Login(Resource):
                 http_code=200
             )
             return {"message": "Login successful", "token": token}, 200
-        else:
+        else:  # credenciales invalidas
             cur.close()
             conn.close()
             log_event(
@@ -164,7 +167,7 @@ def token_required(f):
         logging.debug("Token: "+str(token))
         conn = get_connection()
         cur = conn.cursor()
-        # Query the token in the database and join with users table to retrieve user info
+        # Query token in database and join with users para obtener user info
         cur.execute("""
             SELECT u.id, u.username, u.role, u.full_name, u.email 
             FROM bank.tokens t
@@ -174,7 +177,7 @@ def token_required(f):
         user = cur.fetchone()
         cur.close()
         conn.close()
-        if not user:
+        if not user: 
             api.abort(401, "Invalid or expired token")
         g.user = {
             "id": user[0],
@@ -203,6 +206,7 @@ class Deposit(Resource):
         account_number = data.get("account_number")
         amount = data.get("amount", 0)
         
+        # validar amount
         if amount <= 0:
             log_event(
                 log_type="WARNING",
@@ -215,7 +219,7 @@ class Deposit(Resource):
         
         conn = get_connection()
         cur = conn.cursor()
-        # Update the specified account using its account number (primary key)
+        # actualizar account balance
         cur.execute(
             "UPDATE bank.accounts SET balance = balance + %s WHERE id = %s RETURNING balance",
             (amount, account_number)
@@ -233,7 +237,7 @@ class Deposit(Resource):
                 http_code=404
             )
             api.abort(404, "Account not found")
-        new_balance = float(result[0])
+        nuevo_balance = float(result[0])
         conn.commit()
         cur.close()
         conn.close()
@@ -244,7 +248,7 @@ class Deposit(Resource):
             action=f"Depósito exitoso en cuenta {account_number} por {amount}",
             http_code=200
         )
-        return {"message": "Deposit successful", "new_balance": new_balance}, 200
+        return {"message": "Deposit successful", "new_balance": nuevo_balance}, 200
 
 @bank_ns.route('/withdraw')
 class Withdraw(Resource):
@@ -280,8 +284,8 @@ class Withdraw(Resource):
                 http_code=404
             )
             api.abort(404, "Account not found")
-        current_balance = float(row[0])
-        if current_balance < amount:
+        current_balance = float(row[0]) 
+        if current_balance < amount:  
             cur.close()
             conn.close()
             log_event(
@@ -306,105 +310,6 @@ class Withdraw(Resource):
         )
         return {"message": "Withdrawal successful", "new_balance": new_balance}, 200
 
-@bank_ns.route('/transfer')
-class Transfer(Resource):
-    @bank_ns.expect(transfer_model, validate=True)
-    @bank_ns.doc('transfer')
-    @token_required
-    def post(self):
-        """Transfiere fondos desde la cuenta del usuario autenticado a otra cuenta."""
-        data = api.payload
-        target_username = data.get("target_username")
-        amount = data.get("amount", 0)
-        if not target_username or amount <= 0:
-            log_event(
-                log_type="WARNING",
-                remote_ip=request.remote_addr,
-                username=g.user['username'],
-                action="Intento de transferencia con datos inválidos",
-                http_code=400
-            )
-            api.abort(400, "Invalid data")
-        if target_username == g.user['username']:
-            log_event(
-                log_type="WARNING",
-                remote_ip=request.remote_addr,
-                username=g.user['username'],
-                action="Intento de transferencia a sí mismo",
-                http_code=400
-            )
-            api.abort(400, "Cannot transfer to the same account")
-        conn = get_connection()
-        cur = conn.cursor()
-        # Check sender's balance
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            log_event(
-                log_type="ERROR",
-                remote_ip=request.remote_addr,
-                username=g.user['username'],
-                action="Transferencia fallida: cuenta origen no encontrada",
-                http_code=404
-            )
-            api.abort(404, "Sender account not found")
-        sender_balance = float(row[0])
-        if sender_balance < amount:
-            cur.close()
-            conn.close()
-            log_event(
-                log_type="WARNING",
-                remote_ip=request.remote_addr,
-                username=g.user['username'],
-                action="Transferencia fallida: fondos insuficientes",
-                http_code=400
-            )
-            api.abort(400, "Insufficient funds")
-        # Find target user
-        cur.execute("SELECT id FROM bank.users WHERE username = %s", (target_username,))
-        target_user = cur.fetchone()
-        if not target_user:
-            cur.close()
-            conn.close()
-            log_event(
-                log_type="ERROR",
-                remote_ip=request.remote_addr,
-                username=g.user['username'],
-                action="Transferencia fallida: usuario destino no encontrado",
-                http_code=404
-            )
-            api.abort(404, "Target user not found")
-        target_user_id = target_user[0]
-        try:
-            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, g.user['id']))
-            cur.execute("UPDATE bank.accounts SET balance = balance + %s WHERE user_id = %s", (amount, target_user_id))
-            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
-            new_balance = float(cur.fetchone()[0])
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            cur.close()
-            conn.close()
-            log_event(
-                log_type="ERROR",
-                remote_ip=request.remote_addr,
-                username=g.user['username'],
-                action=f"Error en transferencia: {str(e)}",
-                http_code=500
-            )
-            api.abort(500, f"Error during transfer: {str(e)}")
-        cur.close()
-        conn.close()
-        log_event(
-            log_type="INFO",
-            remote_ip=request.remote_addr,
-            username=g.user['username'],
-            action=f"Transferencia exitosa a {target_username} por {amount}",
-            http_code=200
-        )
-        return {"message": "Transfer successful", "new_balance": new_balance}, 200
 
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
@@ -412,11 +317,6 @@ class CreditPayment(Resource):
     @bank_ns.doc('credit_payment')
     @token_required
     def post(self):
-        """
-        Realiza una compra a crédito:
-        - Descuenta el monto de la cuenta.
-        - Aumenta la deuda de la tarjeta de crédito.
-        """
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
@@ -457,6 +357,7 @@ class CreditPayment(Resource):
             )
             api.abort(400, "Insufficient funds in account")
         try:
+            # debitar en la otra cuenta el monto 
             cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
             cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
@@ -497,11 +398,6 @@ class PayCreditBalance(Resource):
     @bank_ns.doc('pay_credit_balance')
     @token_required
     def post(self):
-        """
-        Realiza un abono a la deuda de la tarjeta:
-        - Descuenta el monto (o el máximo posible) de la cuenta.
-        - Reduce la deuda de la tarjeta de crédito.
-        """
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
@@ -619,6 +515,204 @@ class Logs(Resource):
         cur.close()
         conn.close()
         return {"logs": logs}, 200
+
+@bank_ns.route('/transfer/register')
+class TransferRegister(Resource):
+    @bank_ns.expect(transfer_register_model, validate=True)
+    @bank_ns.doc('transfer_register')
+    @token_required
+    def post(self):
+       
+        data = api.payload
+        target_username = data.get("target_username")
+        amount = data.get("amount", 0)
+        
+        # validacion basica
+        if not target_username or amount <= 0:
+            api.abort(400, "Invalid data")
+        
+        # Check if transferring to self
+        if target_username == g.user['username']:
+            api.abort(400, "Cannot transfer to the same account")
+        
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # verificar balance del sender - CRITICO: no permitir transferencia sin fondos
+        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            api.abort(404, "Sender account not found")
+        
+        sender_balance = float(row[0])
+        if sender_balance < amount:  # insufficient funds check - MANDATORY
+            cur.close()
+            conn.close()
+            api.abort(400, "Fondos insuficientes")
+        
+        # Check if target user exists in same bank
+        cur.execute("SELECT id FROM bank.users WHERE username = %s", (target_username,))
+        target_user = cur.fetchone()
+        if not target_user:
+            cur.close()
+            conn.close()
+            api.abort(404, "Target user not found in this bank. Only transfers between clients of the same bank are allowed.")
+        
+        try:
+            
+            target_user_id = target_user[0]
+            
+            # generate OTP code
+            otp_code = str(random.randint(100000, 999999))
+            
+            # calcular expiration time
+            expires_at = datetime.now() + timedelta(minutes=15)
+            
+            # insert pending transfer
+            cur.execute("""
+                INSERT INTO bank.transfers_pending 
+                (sender_user_id, target_username, target_user_id, amount, otp_code, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (g.user['id'], target_username, target_user_id, amount, otp_code, expires_at))
+            
+            transfer_id = cur.fetchone()[0]
+            conn.commit()
+            
+            # log the transfer registration
+            logging.info(f"Transfer {transfer_id} registered successfully for user {g.user['username']} with OTP {otp_code}")
+            
+            return {
+                "message": "Transfer registered successfully.",
+                "transfer_id": transfer_id,
+                "otp_code": otp_code,
+                "expires_at": expires_at.isoformat(),
+                "note": "Use this OTP code to confirm the transfer with /transfer/confirm"
+            }, 200
+            
+        except Exception as e:
+            conn.rollback()
+            raise Exception(f"Error registering transfer: {str(e)}")
+        finally:
+            cur.close()
+            conn.close()
+
+@bank_ns.route('/transfer/confirm')
+class TransferConfirm(Resource):
+    @bank_ns.expect(transfer_confirm_model, validate=True)
+    @bank_ns.doc('transfer_confirm')
+    @token_required
+    def post(self):
+        data = api.payload
+        otp_code = data.get("otp_code")
+        
+        # validate OTP
+        if not otp_code or len(otp_code) != 6:
+            api.abort(400, "Invalid OTP code")
+        
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        try:
+            # buscar transferencia con OTP valido
+            cur.execute("""
+                SELECT id, target_user_id, amount, target_username
+                FROM bank.transfers_pending 
+                WHERE sender_user_id = %s AND otp_code = %s 
+                AND status = 'pending' AND expires_at > NOW()
+                LIMIT 1
+            """, (g.user['id'], otp_code))
+            
+            transfer_data = cur.fetchone()
+            
+            if not transfer_data:  # OTP invalid or expired
+                api.abort(400, "Invalid or expired OTP code")
+            
+            transfer_id, target_user_id, amount, target_username = transfer_data
+            amount = float(amount)
+            
+            # Check balance again before transfer
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
+            row = cur.fetchone()
+            if not row:
+                api.abort(404, "Sender account not found")
+            
+            sender_balance = float(row[0])
+            if sender_balance < amount:  # balance verification
+                api.abort(400, "Insufficient funds for this transfer")
+            
+            # ejecutar la transferencia
+            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", 
+                       (amount, g.user['id']))
+            cur.execute("UPDATE bank.accounts SET balance = balance + %s WHERE user_id = %s", 
+                       (amount, target_user_id))
+            
+            # mark transfer as completed
+            cur.execute("UPDATE bank.transfers_pending SET status = 'completed' WHERE id = %s", 
+                       (transfer_id,))
+            
+            # get new balance
+            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
+            new_balance = float(cur.fetchone()[0])
+            
+            conn.commit()
+            
+            return {
+                "message": "Transfer executed successfully",
+                "transfer_id": transfer_id,
+                "target_username": target_username,
+                "amount": amount,
+                "new_balance": new_balance
+            }, 200
+            
+        except Exception as e:
+            conn.rollback()
+            api.abort(500, f"Error executing transfers: {str(e)}")
+        finally:
+            cur.close()
+            conn.close()
+
+@bank_ns.route('/transfer/pending')
+class PendingTransfers(Resource):
+    @bank_ns.doc('pending_transfers')
+    @token_required
+    def get(self):
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        try:
+            # buscar pending transfers
+            cur.execute("""
+                SELECT id, target_username, amount, created_at, expires_at
+                FROM bank.transfers_pending 
+                WHERE sender_user_id = %s AND status = 'pending' AND expires_at > NOW()
+                ORDER BY created_at
+            """, (g.user['id'],))
+            
+            transfers = cur.fetchall()
+            
+            pending_list = []  # lista de transferencias pendientes
+            for transfer in transfers:
+                pending_list.append({
+                    "transfer_id": transfer[0],
+                    "target_username": transfer[1],
+                    "amount": float(transfer[2]),
+                    "created_at": transfer[3].isoformat(),
+                    "expires_at": transfer[4].isoformat()
+                })
+            
+            total_amt = sum(t["amount"] for t in pending_list)  # variable con nombre corto
+            
+            return {
+                "pending_transfers": pending_list,
+                "total_amount": total_amt
+            }, 200
+            
+        finally:
+            cur.close()
+            conn.close()
 
 @app.before_first_request
 def initialize_db():
