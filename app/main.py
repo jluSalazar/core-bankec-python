@@ -2,7 +2,8 @@ import secrets
 from flask import Flask, request, g
 from flask_restx import Api, Resource, fields # type: ignore
 from functools import wraps
-from .db import get_connection, init_db
+from app.db import get_connection, init_db
+from app.logs.logs import log_event
 import logging
 
 # Define a simple in-memory token store
@@ -95,10 +96,24 @@ class Login(Resource):
             conn.commit()
             cur.close()
             conn.close()
+            log_event(
+                log_type="INFO",
+                remote_ip=request.remote_addr,
+                username=username,
+                action="Login exitoso",
+                http_code=200
+            )
             return {"message": "Login successful", "token": token}, 200
         else:
             cur.close()
             conn.close()
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=username,
+                action="Intento de login fallido",
+                http_code=401
+            )
             api.abort(401, "Invalid credentials")
 
 @auth_ns.route('/logout')
@@ -117,10 +132,24 @@ class Logout(Resource):
             conn.commit()
             cur.close()
             conn.close()
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=None,
+                action="Intento de logout con token inválido",
+                http_code=401
+            )
             api.abort(401, "Invalid token")
         conn.commit()
         cur.close()
         conn.close()
+        log_event(
+            log_type="INFO",
+            remote_ip=request.remote_addr,
+            username=None,
+            action="Logout exitoso",
+            http_code=200
+        )
         return {"message": "Logout successful"}, 200
 
 # ---------------- Token-Required Decorator ----------------
@@ -175,6 +204,13 @@ class Deposit(Resource):
         amount = data.get("amount", 0)
         
         if amount <= 0:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de depósito con monto inválido",
+                http_code=400
+            )
             api.abort(400, "Amount must be greater than zero")
         
         conn = get_connection()
@@ -189,11 +225,25 @@ class Deposit(Resource):
             conn.rollback()
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Depósito fallido: cuenta no encontrada",
+                http_code=404
+            )
             api.abort(404, "Account not found")
         new_balance = float(result[0])
         conn.commit()
         cur.close()
         conn.close()
+        log_event(
+            log_type="INFO",
+            remote_ip=request.remote_addr,
+            username=g.user['username'],
+            action=f"Depósito exitoso en cuenta {account_number} por {amount}",
+            http_code=200
+        )
         return {"message": "Deposit successful", "new_balance": new_balance}, 200
 
 @bank_ns.route('/withdraw')
@@ -206,6 +256,13 @@ class Withdraw(Resource):
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de retiro con monto inválido",
+                http_code=400
+            )
             api.abort(400, "Amount must be greater than zero")
         user_id = g.user['id']
         conn = get_connection()
@@ -215,17 +272,38 @@ class Withdraw(Resource):
         if not row:
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Retiro fallido: cuenta no encontrada",
+                http_code=404
+            )
             api.abort(404, "Account not found")
         current_balance = float(row[0])
         if current_balance < amount:
             cur.close()
             conn.close()
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Retiro fallido: fondos insuficientes",
+                http_code=400
+            )
             api.abort(400, "Insufficient funds")
         cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s RETURNING balance", (amount, user_id))
         new_balance = float(cur.fetchone()[0])
         conn.commit()
         cur.close()
         conn.close()
+        log_event(
+            log_type="INFO",
+            remote_ip=request.remote_addr,
+            username=g.user['username'],
+            action=f"Retiro exitoso de {amount}",
+            http_code=200
+        )
         return {"message": "Withdrawal successful", "new_balance": new_balance}, 200
 
 @bank_ns.route('/transfer')
@@ -239,8 +317,22 @@ class Transfer(Resource):
         target_username = data.get("target_username")
         amount = data.get("amount", 0)
         if not target_username or amount <= 0:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de transferencia con datos inválidos",
+                http_code=400
+            )
             api.abort(400, "Invalid data")
         if target_username == g.user['username']:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de transferencia a sí mismo",
+                http_code=400
+            )
             api.abort(400, "Cannot transfer to the same account")
         conn = get_connection()
         cur = conn.cursor()
@@ -250,11 +342,25 @@ class Transfer(Resource):
         if not row:
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Transferencia fallida: cuenta origen no encontrada",
+                http_code=404
+            )
             api.abort(404, "Sender account not found")
         sender_balance = float(row[0])
         if sender_balance < amount:
             cur.close()
             conn.close()
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Transferencia fallida: fondos insuficientes",
+                http_code=400
+            )
             api.abort(400, "Insufficient funds")
         # Find target user
         cur.execute("SELECT id FROM bank.users WHERE username = %s", (target_username,))
@@ -262,6 +368,13 @@ class Transfer(Resource):
         if not target_user:
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Transferencia fallida: usuario destino no encontrado",
+                http_code=404
+            )
             api.abort(404, "Target user not found")
         target_user_id = target_user[0]
         try:
@@ -274,9 +387,23 @@ class Transfer(Resource):
             conn.rollback()
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action=f"Error en transferencia: {str(e)}",
+                http_code=500
+            )
             api.abort(500, f"Error during transfer: {str(e)}")
         cur.close()
         conn.close()
+        log_event(
+            log_type="INFO",
+            remote_ip=request.remote_addr,
+            username=g.user['username'],
+            action=f"Transferencia exitosa a {target_username} por {amount}",
+            http_code=200
+        )
         return {"message": "Transfer successful", "new_balance": new_balance}, 200
 
 @bank_ns.route('/credit-payment')
@@ -293,6 +420,13 @@ class CreditPayment(Resource):
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de compra a crédito con monto inválido",
+                http_code=400
+            )
             api.abort(400, "Amount must be greater than zero")
         user_id = g.user['id']
         conn = get_connection()
@@ -302,11 +436,25 @@ class CreditPayment(Resource):
         if not row:
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Compra a crédito fallida: cuenta no encontrada",
+                http_code=404
+            )
             api.abort(404, "Account not found")
         account_balance = float(row[0])
         if account_balance < amount:
             cur.close()
             conn.close()
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Compra a crédito fallida: fondos insuficientes",
+                http_code=400
+            )
             api.abort(400, "Insufficient funds in account")
         try:
             cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
@@ -320,9 +468,23 @@ class CreditPayment(Resource):
             conn.rollback()
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action=f"Error en compra a crédito: {str(e)}",
+                http_code=500
+            )
             api.abort(500, f"Error processing credit card purchase: {str(e)}")
         cur.close()
         conn.close()
+        log_event(
+            log_type="INFO",
+            remote_ip=request.remote_addr,
+            username=g.user['username'],
+            action=f"Compra a crédito exitosa por {amount}",
+            http_code=200
+        )
         return {
             "message": "Credit card purchase successful",
             "account_balance": new_account_balance,
@@ -343,6 +505,13 @@ class PayCreditBalance(Resource):
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Intento de abono a crédito con monto inválido",
+                http_code=400
+            )
             api.abort(400, "Amount must be greater than zero")
         user_id = g.user['id']
         conn = get_connection()
@@ -353,11 +522,25 @@ class PayCreditBalance(Resource):
         if not row:
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Abono a crédito fallido: cuenta no encontrada",
+                http_code=404
+            )
             api.abort(404, "Account not found")
         account_balance = float(row[0])
         if account_balance < amount:
             cur.close()
             conn.close()
+            log_event(
+                log_type="WARNING",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Abono a crédito fallido: fondos insuficientes",
+                http_code=400
+            )
             api.abort(400, "Insufficient funds in account")
         # Get current credit card debt
         cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
@@ -365,6 +548,13 @@ class PayCreditBalance(Resource):
         if not row:
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action="Abono a crédito fallido: tarjeta no encontrada",
+                http_code=404
+            )
             api.abort(404, "Credit card not found")
         credit_debt = float(row[0])
         payment = min(amount, credit_debt)
@@ -380,14 +570,55 @@ class PayCreditBalance(Resource):
             conn.rollback()
             cur.close()
             conn.close()
+            log_event(
+                log_type="ERROR",
+                remote_ip=request.remote_addr,
+                username=g.user['username'],
+                action=f"Error en abono a crédito: {str(e)}",
+                http_code=500
+            )
             api.abort(500, f"Error processing credit balance payment: {str(e)}")
         cur.close()
         conn.close()
+        log_event(
+            log_type="INFO",
+            remote_ip=request.remote_addr,
+            username=g.user['username'],
+            action=f"Abono a crédito exitoso por {payment}",
+            http_code=200
+        )
         return {
             "message": "Credit card debt payment successful",
             "account_balance": new_account_balance,
             "credit_card_debt": new_credit_debt
         }, 200
+# Endpoint para consultar logs
+@api.route('/logs')
+class Logs(Resource):
+    def get(self):
+        """Devuelve los logs del sistema (máximo 1000 registros, ordenados por fecha descendente)."""
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT log_time, log_type, remote_ip, username, action, http_code
+            FROM bank.logs
+            ORDER BY log_time DESC
+            LIMIT 1000
+        """)
+        logs = [
+            {
+                "log_time": str(row[0]),
+                "log_type": row[1],
+                "remote_ip": row[2],
+                "username": row[3],
+                "action": row[4],
+                "http_code": row[5]
+            }
+            for row in cur.fetchall()
+        ]
+        cur.close()
+        conn.close()
+        return {"logs": logs}, 200
 
 @app.before_first_request
 def initialize_db():
