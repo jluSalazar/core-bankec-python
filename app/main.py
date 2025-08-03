@@ -4,6 +4,7 @@ from flask_restx import Api, Resource, fields # type: ignore
 from functools import wraps
 from app.db import get_connection, init_db
 from app.logs.logs import log_event
+from app.jwt_config import generate_jwt_token, jwt_required, mask_sensitive_data
 import logging
 import random
 from datetime import datetime, timedelta
@@ -28,7 +29,7 @@ authorizations = {
         'type': 'apiKey',
         'in': 'header',
         'name': 'Authorization',
-        'description': "Enter your token in the format **Bearer <token>**"
+        'description': "Enter your JWT token in the format **Bearer <jwt_token>**"
     }
 }
 
@@ -37,14 +38,14 @@ api = Api(
     app,
     version='1.0',
     title='Core Bancario API',
-    description='API para operaciones bancarias, incluyendo autenticación y operaciones de cuenta.',
+    description='API para operaciones bancarias con autenticación JWT, incluyendo autenticación y operaciones de cuenta.',
     doc='/swagger',  # Swagger UI endpoint
     authorizations=authorizations,
     security='Bearer'
 )
 
 # Create namespaces for authentication and bank operations
-auth_ns = api.namespace('auth', description='Operaciones de autenticación')
+auth_ns = api.namespace('auth', description='Operaciones de autenticación JWT')
 bank_ns = api.namespace('bank', description='Operaciones bancarias')
 
 # Define the expected payload models for Swagger
@@ -86,7 +87,7 @@ class Login(Resource):
     @auth_ns.expect(login_model, validate=True)
     @auth_ns.doc('login')
     def post(self):
-        """Inicia sesión y devuelve un token de autenticación."""
+        """Inicia sesión y devuelve un token JWT de autenticación."""
         data = api.payload
         username = data.get("username")
         password = data.get("password")
@@ -96,27 +97,41 @@ class Login(Resource):
         cur.execute("SELECT id, username, password, role, full_name, email FROM bank.users WHERE username = %s", (username,))
         user = cur.fetchone()
         if user and user[2] == password:
-            token = secrets.token_hex(16)
-            # Persist token in database
-            cur.execute("INSERT INTO bank.tokens (token, user_id) VALUES (%s, %s)", (token, user[0]))
-            conn.commit()
+            # Crear datos del usuario para el JWT
+            user_data = {
+                'id': user[0],
+                'username': user[1],
+                'role': user[3],
+                'full_name': user[4],
+                'email': user[5]
+            }
+            
+            # Generar token JWT
+            jwt_token = generate_jwt_token(user_data)
+            
             cur.close()
             conn.close()
+            
             log_event(
                 log_type="INFO",
                 remote_ip=request.remote_addr,
                 username=username,
-                action="Login exitoso",
+                action="Login exitoso con JWT",
                 http_code=200
             )
-            return {"message": "Login successful", "token": token}, 200
+            return {
+                "message": "Login successful", 
+                "token": jwt_token,
+                "token_type": "JWT",
+                "expires_in": "24 hours"
+            }, 200
         else:  # credenciales invalidas
             cur.close()
             conn.close()
             log_event(
                 log_type="WARNING",
                 remote_ip=request.remote_addr,
-                username=username,
+                username=mask_sensitive_data(username),
                 action="Intento de login fallido",
                 http_code=401
             )
@@ -124,82 +139,29 @@ class Login(Resource):
 
 @auth_ns.route('/logout')
 class Logout(Resource):
-    @auth_ns.doc('logout')
+    @auth_ns.doc('logout', security='Bearer')
+    @jwt_required
     def post(self):
-        """Invalida el token de autenticación."""
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            api.abort(401, "Authorization header missing or invalid")
-        token = auth_header.split(" ")[1]
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM bank.tokens WHERE token = %s", (token,))
-        if cur.rowcount == 0:
-            conn.commit()
-            cur.close()
-            conn.close()
-            log_event(
-                log_type="WARNING",
-                remote_ip=request.remote_addr,
-                username=None,
-                action="Intento de logout con token inválido",
-                http_code=401
-            )
-            api.abort(401, "Invalid token")
-        conn.commit()
-        cur.close()
-        conn.close()
+        """Invalida la sesión actual (con JWT no se puede invalidar el token hasta que expire)."""
         log_event(
             log_type="INFO",
             remote_ip=request.remote_addr,
-            username=None,
+            username=g.user['username'],
             action="Logout exitoso",
             http_code=200
         )
-        return {"message": "Logout successful"}, 200
-
-# ---------------- Token-Required Decorator ----------------
-
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            api.abort(401, "Authorization header missing or invalid")
-        token = auth_header.split(" ")[1]
-        logging.debug("Token: "+str(token))
-        conn = get_connection()
-        cur = conn.cursor()
-        # Query token in database and join with users para obtener user info
-        cur.execute("""
-            SELECT u.id, u.username, u.role, u.full_name, u.email 
-            FROM bank.tokens t
-            JOIN bank.users u ON t.user_id = u.id
-            WHERE t.token = %s
-        """, (token,))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
-        if not user: 
-            api.abort(401, "Invalid or expired token")
-        g.user = {
-            "id": user[0],
-            "username": user[1],
-            "role": user[2],
-            "full_name": user[3],
-            "email": user[4]
-        }
-        return f(*args, **kwargs)
-    return decorated
+        return {
+            "message": "Logout successful",
+            "note": "JWT token will remain valid until expiration. Consider implementing a blacklist for production."
+        }, 200
 
 # ---------------- Banking Operation Endpoints ----------------
 
 @bank_ns.route('/deposit')
 class Deposit(Resource):
-    logging.debug("Entering....")
     @bank_ns.expect(deposit_model, validate=True)
-    @bank_ns.doc('deposit')
-    @token_required
+    @bank_ns.doc('deposit', security='Bearer')
+    @jwt_required
     def post(self):
         """
         Realiza un depósito en la cuenta especificada.
@@ -236,7 +198,7 @@ class Deposit(Resource):
                 log_type="ERROR",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action="Depósito fallido: cuenta no encontrada",
+                action=f"Depósito fallido: cuenta {mask_sensitive_data(str(account_number))} no encontrada",
                 http_code=404
             )
             api.abort(404, "Account not found")
@@ -248,7 +210,7 @@ class Deposit(Resource):
             log_type="INFO",
             remote_ip=request.remote_addr,
             username=g.user['username'],
-            action=f"Depósito exitoso en cuenta {account_number} por {amount}",
+            action=f"Depósito exitoso en cuenta {mask_sensitive_data(str(account_number))} por {amount}",
             http_code=200
         )
         return {"message": "Deposit successful", "new_balance": nuevo_balance}, 200
@@ -256,8 +218,8 @@ class Deposit(Resource):
 @bank_ns.route('/withdraw')
 class Withdraw(Resource):
     @bank_ns.expect(withdraw_model, validate=True)
-    @bank_ns.doc('withdraw')
-    @token_required
+    @bank_ns.doc('withdraw', security='Bearer')
+    @jwt_required
     def post(self):
         """Realiza un retiro de la cuenta del usuario autenticado."""
         data = api.payload
@@ -317,9 +279,10 @@ class Withdraw(Resource):
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
     @bank_ns.expect(credit_payment_model, validate=True)
-    @bank_ns.doc('credit_payment')
-    @token_required
+    @bank_ns.doc('credit_payment', security='Bearer')
+    @jwt_required
     def post(self):
+        """Realiza una compra a crédito."""
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
@@ -376,7 +339,7 @@ class CreditPayment(Resource):
                 log_type="ERROR",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action=f"Error en compra a crédito: {str(e)}",
+                action=f"Error en compra a crédito: {mask_sensitive_data(str(e))}",
                 http_code=500
             )
             api.abort(500, f"Error processing credit card purchase: {str(e)}")
@@ -398,9 +361,10 @@ class CreditPayment(Resource):
 @bank_ns.route('/pay-credit-balance')
 class PayCreditBalance(Resource):
     @bank_ns.expect(pay_credit_balance_model, validate=True)
-    @bank_ns.doc('pay_credit_balance')
-    @token_required
+    @bank_ns.doc('pay_credit_balance', security='Bearer')
+    @jwt_required
     def post(self):
+        """Realiza un abono al saldo de la tarjeta de crédito."""
         data = api.payload
         amount = data.get("amount", 0)
         if amount <= 0:
@@ -473,7 +437,7 @@ class PayCreditBalance(Resource):
                 log_type="ERROR",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action=f"Error en abono a crédito: {str(e)}",
+                action=f"Error en abono a crédito: {mask_sensitive_data(str(e))}",
                 http_code=500
             )
             api.abort(500, f"Error processing credit balance payment: {str(e)}")
@@ -491,9 +455,12 @@ class PayCreditBalance(Resource):
             "account_balance": new_account_balance,
             "credit_card_debt": new_credit_debt
         }, 200
+
 # Endpoint para consultar logs
 @api.route('/logs')
 class Logs(Resource):
+    @api.doc('logs', security='Bearer')
+    @jwt_required
     def get(self):
         """Devuelve los logs del sistema (máximo 1000 registros, ordenados por fecha descendente)."""
         conn = get_connection()
@@ -517,15 +484,22 @@ class Logs(Resource):
         ]
         cur.close()
         conn.close()
+        log_event(
+            log_type="INFO",
+            remote_ip=request.remote_addr,
+            username=g.user['username'],
+            action="Consulta de logs del sistema",
+            http_code=200
+        )
         return {"logs": logs}, 200
 
 @bank_ns.route('/transfer/register')
 class TransferRegister(Resource):
     @bank_ns.expect(transfer_register_model, validate=True)
-    @bank_ns.doc('transfer_register')
-    @token_required
+    @bank_ns.doc('transfer_register', security='Bearer')
+    @jwt_required
     def post(self):
-       
+        """Registra una transferencia y genera un código OTP para confirmación."""
         data = api.payload
         target_username = data.get("target_username")
         amount = data.get("amount", 0)
@@ -590,7 +564,7 @@ class TransferRegister(Resource):
                 log_type="WARNING",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action="Intento de registro de transferencia a usuario no encontrado",
+                action=f"Intento de registro de transferencia a usuario no encontrado: {mask_sensitive_data(target_username)}",
                 http_code=404
             )
             cur.close()
@@ -628,7 +602,7 @@ class TransferRegister(Resource):
                 log_type="INFO",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action=f"Transferencia registrada (id={transfer_id}) a {target_username} por {amount} OTP:{otp_code}",
+                action=f"Transferencia registrada (id={transfer_id}) a {mask_sensitive_data(target_username)} por {amount} OTP:{mask_sensitive_data(otp_code)}",
                 http_code=200
             )
 
@@ -650,9 +624,10 @@ class TransferRegister(Resource):
 @bank_ns.route('/transfer/confirm')
 class TransferConfirm(Resource):
     @bank_ns.expect(transfer_confirm_model, validate=True)
-    @bank_ns.doc('transfer_confirm')
-    @token_required
+    @bank_ns.doc('transfer_confirm', security='Bearer')
+    @jwt_required
     def post(self):
+        """Confirma una transferencia previamente registrada usando el código OTP."""
         data = api.payload
         otp_code = data.get("otp_code")
         
@@ -686,7 +661,7 @@ class TransferConfirm(Resource):
                 log_type="WARNING",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action="Intento de confirmación de transferencia con OTP inválido o expirado",
+                action=f"Intento de confirmación de transferencia con OTP inválido o expirado: {mask_sensitive_data(otp_code)}",
                 http_code=400
             )
             cur.close()
@@ -741,7 +716,7 @@ class TransferConfirm(Resource):
                 log_type="INFO",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action=f"Transferencia confirmada (id={transfer_id}) a {target_username} por {amount}",
+                action=f"Transferencia confirmada (id={transfer_id}) a {mask_sensitive_data(target_username)} por {amount}",
                 http_code=200
             )
             return {
@@ -758,7 +733,7 @@ class TransferConfirm(Resource):
                 log_type="ERROR",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action="Error ejecutando transferencia",
+                action=f"Error ejecutando transferencia: {mask_sensitive_data(str(e))}",
                 http_code=500
             )
             api.abort(500, f"Error executing transfers: {str(e)}")
@@ -768,9 +743,10 @@ class TransferConfirm(Resource):
 
 @bank_ns.route('/transfer/pending')
 class PendingTransfers(Resource):
-    @bank_ns.doc('pending_transfers')
-    @token_required
+    @bank_ns.doc('pending_transfers', security='Bearer')
+    @jwt_required
     def get(self):
+        """Obtiene las transferencias pendientes del usuario autenticado."""
         conn = get_connection()
         cur = conn.cursor()
         
@@ -818,4 +794,3 @@ def initialize_db():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
-
