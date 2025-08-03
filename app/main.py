@@ -8,6 +8,9 @@ import logging
 import random
 from datetime import datetime, timedelta
 
+# SQL constantes
+UPDATE_BANK_ACCOUNTS_SQL = "UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s"
+
 #log = logging.getLogger(__name__)
 logging.basicConfig(
      filename="app.log",
@@ -358,7 +361,7 @@ class CreditPayment(Resource):
             api.abort(400, "Insufficient funds in account")
         try:
             # debitar en la otra cuenta el monto 
-            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
+            cur.execute(UPDATE_BANK_ACCOUNTS_SQL, (amount, user_id))
             cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
             new_account_balance = float(cur.fetchone()[0])
@@ -455,7 +458,7 @@ class PayCreditBalance(Resource):
         credit_debt = float(row[0])
         payment = min(amount, credit_debt)
         try:
-            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
+            cur.execute(UPDATE_BANK_ACCOUNTS_SQL, (payment, user_id))
             cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
             cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
             new_account_balance = float(cur.fetchone()[0])
@@ -639,7 +642,7 @@ class TransferRegister(Resource):
             
         except Exception as e:
             conn.rollback()
-            raise Exception(f"Error registering transfer: {str(e)}")
+            raise RuntimeError(f"Error registering transfer: {str(e)}")
         finally:
             cur.close()
             conn.close()
@@ -720,7 +723,7 @@ class TransferConfirm(Resource):
                 api.abort(400, "Insufficient funds for this transfer")
             
             # ejecutar la transferencia
-            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", 
+            cur.execute(UPDATE_BANK_ACCOUNTS_SQL, 
                        (amount, g.user['id']))
             cur.execute("UPDATE bank.accounts SET balance = balance + %s WHERE user_id = %s", 
                        (amount, target_user_id))
@@ -755,7 +758,7 @@ class TransferConfirm(Resource):
                 log_type="ERROR",
                 remote_ip=request.remote_addr,
                 username=g.user['username'],
-                action=f"Error ejecutando transferencia",
+                action="Error ejecutando transferencia",
                 http_code=500
             )
             api.abort(500, f"Error executing transfers: {str(e)}")
