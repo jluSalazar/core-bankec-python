@@ -1,23 +1,25 @@
 # app/db.py
-import os
 import psycopg2
-
-# Variables de entorno (definidas en docker-compose o con valores por defecto)
-DB_HOST = os.environ.get('POSTGRES_HOST', 'db')
-DB_PORT = os.environ.get('POSTGRES_PORT', '5432')
-DB_NAME = os.environ.get('POSTGRES_DB', 'corebank')
-DB_USER = os.environ.get('POSTGRES_USER', 'postgres')
-DB_PASSWORD = os.environ.get('POSTGRES_PASSWORD', 'postgres')
+from .config import Config
+from .logger import log_action
 
 def get_connection():
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD
-    )
-    return conn
+    try:
+        conn = psycopg2.connect(
+            host=Config.DB_HOST,
+            port=Config.DB_PORT,
+            dbname=Config.DB_NAME,
+            user=Config.DB_USER,
+            password=Config.DB_PASSWORD
+        )
+        return conn
+    except psycopg2.Error as e:
+        log_action(
+            action="DB_CONNECTION_ERROR",
+            details=f"Failed to connect to database: {str(e)}",
+            level="ERROR"
+        )
+        raise
 
 def init_db():
     conn = get_connection()
